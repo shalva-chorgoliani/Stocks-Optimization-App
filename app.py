@@ -322,4 +322,4 @@ if run_button:
         st.dataframe(weights_sharpe.apply(lambda x: f"{x:.2%}"), use_container_width=True)
 
 else:
-    st.info("Set your tickers and parameters in the sidebar, then click **Run Optimization**.")
+    st.info("Set your tickers and parameters in the sidebar, then click **Run Optimization**. Tickers must be valid Yahoo Finance symbols (e.g. AAPL, VWCE.DE, CSX5.L).")
