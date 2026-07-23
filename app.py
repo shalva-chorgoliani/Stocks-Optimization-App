@@ -1,11 +1,75 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import yfinance as yf
 import streamlit as st
+import requests
 from scipy.optimize import minimize
 
 st.set_page_config(page_title="GARCH Portfolio Optimizer", layout="wide")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def search_symbols(query):
+    """Look up matching tickers/companies from Yahoo Finance's search endpoint."""
+    query = query.strip()
+    if len(query) < 2:
+        return []
+    try:
+        resp = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={"q": query, "quotesCount": 8, "newsCount": 0, "listsCount": 0},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        quotes = resp.json().get("quotes", [])
+    except Exception:
+        return []
+
+    results = []
+    for q in quotes:
+        symbol = q.get("symbol")
+        if not symbol:
+            continue
+        name = q.get("shortname") or q.get("longname") or ""
+        exch = q.get("exchange", "")
+        qtype = q.get("quoteType", "")
+        results.append({"symbol": symbol, "name": name, "exchange": exch, "type": qtype})
+    return results
+
+
+def resolve_display_name(symbol, known_name):
+    """Return the best available full name for a ticker, falling back to a search lookup."""
+    if known_name:
+        return known_name
+    for m in search_symbols(symbol):
+        if m["symbol"] == symbol and m["name"]:
+            return m["name"]
+    return symbol
+
+
+def render_holdings(weights_series, name_map, bar_color):
+    """Render a clean, styled list of holdings with proportional bars."""
+    rows = []
+    for symbol, weight in weights_series.items():
+        name = name_map.get(symbol, symbol)
+        pct = weight * 100
+        rows.append(f"""
+        <div style="margin-bottom:12px;">
+            <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:3px;">
+                <span style="font-size:0.95em;">
+                    <span style="font-weight:600;">{name}</span>
+                    <span style="color:#888; font-size:0.82em; margin-left:4px;">{symbol}</span>
+                </span>
+                <span style="font-weight:600; font-size:0.95em;">{pct:.1f}%</span>
+            </div>
+            <div style="background:#eee; border-radius:6px; height:8px; width:100%;">
+                <div style="background:{bar_color}; width:{pct:.2f}%; height:8px; border-radius:6px;"></div>
+            </div>
+        </div>
+        """)
+    st.markdown("".join(rows), unsafe_allow_html=True)
 
 # ----------------------------------------------------------------------
 # Core optimization logic (adapted from the original script)
@@ -171,18 +235,8 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
     mask = ~np.isnan(rets)
     rets, vols = rets[mask], vols[mask]
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(vols, rets, 'b-', lw=2, label='Efficient Frontier (GARCH)')
-    ax.scatter(v, r, color='green', s=100, label=f'Your Portfolio (λ={lambda_param})')
-    ax.scatter(v2, r2, color='red', s=150, marker='*', label='Max Sharpe')
-    ax.set_xlabel('Volatility (Annualized, GARCH)')
-    ax.set_ylabel('Expected Return (Annualized, GARCH)')
-    ax.set_title(f'GARCH(1,1) Mean-Variance Frontier ({frequency.capitalize()} Data)')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
     asset_names = pd.Index(valid_assets)
-    return portfolio, max_sharpe, asset_names, fig, log_msgs
+    return portfolio, max_sharpe, asset_names, vols, rets, log_msgs
 
 
 # ----------------------------------------------------------------------
@@ -196,13 +250,65 @@ st.caption("Fits a GARCH(1,1) model to each asset, then builds an efficient fron
 with st.sidebar:
     st.header("Settings")
 
-    tickers_text = st.text_area(
-        "Tickers (comma-separated)",
-        value="",
-        placeholder="e.g. AAPL, MSFT, VWCE.DE",
-        help="Use Yahoo Finance ticker symbols, e.g. AAPL, MSFT, VWCE.DE"
+    if "selected_tickers" not in st.session_state:
+        st.session_state.selected_tickers = []  # list of {"symbol", "name", "exchange"}
+
+    st.subheader("Stocks")
+    search_query = st.text_input(
+        "🔍 Search by company name or ticker",
+        placeholder="e.g. Apple, Microsoft, VWCE",
+        key="ticker_search_box",
     )
-    tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
+
+    if search_query and len(search_query.strip()) >= 2:
+        matches = search_symbols(search_query)
+        if matches:
+            for m in matches:
+                already_added = any(t["symbol"] == m["symbol"] for t in st.session_state.selected_tickers)
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    label = f"**{m['symbol']}** — {m['name']}" if m["name"] else f"**{m['symbol']}**"
+                    if m["exchange"]:
+                        label += f"  \n*{m['exchange']}*"
+                    st.markdown(label)
+                with c2:
+                    if already_added:
+                        st.button("✓", key=f"added_{m['symbol']}", disabled=True)
+                    elif st.button("➕", key=f"add_{m['symbol']}"):
+                        st.session_state.selected_tickers.append(m)
+                        st.rerun()
+        else:
+            st.caption("No matches found. You can still add the raw ticker below.")
+
+    with st.expander("Add a raw ticker manually"):
+        manual_ticker = st.text_input("Ticker symbol", placeholder="e.g. CSX5.L", key="manual_ticker_box")
+        if st.button("Add ticker", key="add_manual_ticker") and manual_ticker.strip():
+            symbol = manual_ticker.strip().upper()
+            if not any(t["symbol"] == symbol for t in st.session_state.selected_tickers):
+                st.session_state.selected_tickers.append({"symbol": symbol, "name": "", "exchange": ""})
+                st.rerun()
+
+    st.markdown("**Selected stocks:**")
+    if st.session_state.selected_tickers:
+        for t in list(st.session_state.selected_tickers):
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.write(f"{t['symbol']}" + (f" — {t['name']}" if t["name"] else ""))
+            with c2:
+                if st.button("✕", key=f"remove_{t['symbol']}"):
+                    st.session_state.selected_tickers = [
+                        x for x in st.session_state.selected_tickers if x["symbol"] != t["symbol"]
+                    ]
+                    st.rerun()
+        if st.button("Clear all", use_container_width=True):
+            st.session_state.selected_tickers = []
+            st.rerun()
+    else:
+        st.caption("No stocks selected yet — search above and tap ➕ to add.")
+
+    tickers = [t["symbol"] for t in st.session_state.selected_tickers]
+
+    st.divider()
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -238,7 +344,7 @@ with st.sidebar:
 
 if run_button:
     if len(tickers) < 2:
-        st.error("Please enter at least 2 tickers.")
+        st.error("Please add at least 2 stocks using the search box.")
         st.stop()
 
     with st.spinner(f"Downloading {frequency} price data for {len(tickers)} tickers..."):
@@ -285,7 +391,7 @@ if run_button:
         progress_bar.progress(frac, text=f"Fitting GARCH(1,1) models... {int(frac * 100)}%")
 
     try:
-        portfolio, max_sharpe, asset_names, fig, log_msgs = mean_variance_optimization_garch(
+        portfolio, max_sharpe, asset_names, frontier_vols, frontier_rets, log_msgs = mean_variance_optimization_garch(
             returns, lambda_param=lambda_param, risk_free_rate=risk_free_rate,
             frequency=frequency, progress_callback=update_progress
         )
@@ -299,27 +405,69 @@ if run_button:
         for msg in log_msgs:
             st.text(msg)
 
-    st.pyplot(fig)
+    # Map ticker -> full company name (from search selections, backfilled if needed)
+    known_names = {t["symbol"]: t["name"] for t in st.session_state.selected_tickers}
+    name_map = {sym: resolve_display_name(sym, known_names.get(sym, "")) for sym in asset_names}
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader(f"Optimal Portfolio (λ={lambda_param})")
-        st.metric("Expected Return", f"{portfolio['return']:.2%}")
-        st.metric("Volatility", f"{portfolio['volatility']:.2%}")
-        st.metric("Sharpe Ratio", f"{portfolio['sharpe']:.3f}")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Expected Return", f"{portfolio['return']:.2%}")
+        m2.metric("Volatility", f"{portfolio['volatility']:.2%}")
+        m3.metric("Sharpe Ratio", f"{portfolio['sharpe']:.3f}")
         weights = pd.Series(portfolio['weights'], index=asset_names, name="Weight")
         weights = weights[weights > 0.0001].sort_values(ascending=False)
-        st.dataframe(weights.apply(lambda x: f"{x:.2%}"), use_container_width=True)
+        render_holdings(weights, name_map, bar_color="#54A24B")
 
     with col2:
         st.subheader("Max Sharpe Portfolio")
-        st.metric("Expected Return", f"{max_sharpe['return']:.2%}")
-        st.metric("Volatility", f"{max_sharpe['volatility']:.2%}")
-        st.metric("Sharpe Ratio", f"{max_sharpe['sharpe']:.3f}")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Expected Return", f"{max_sharpe['return']:.2%}")
+        m2.metric("Volatility", f"{max_sharpe['volatility']:.2%}")
+        m3.metric("Sharpe Ratio", f"{max_sharpe['sharpe']:.3f}")
         weights_sharpe = pd.Series(max_sharpe['weights'], index=asset_names, name="Weight")
         weights_sharpe = weights_sharpe[weights_sharpe > 0.0001].sort_values(ascending=False)
-        st.dataframe(weights_sharpe.apply(lambda x: f"{x:.2%}"), use_container_width=True)
+        render_holdings(weights_sharpe, name_map, bar_color="#E45756")
+
+    st.divider()
+    st.subheader("Efficient Frontier")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=frontier_vols, y=frontier_rets, mode='lines',
+        name='Efficient Frontier',
+        line=dict(color='#4C78A8', width=3, shape='spline'),
+        hovertemplate='Volatility: %{x:.2%}<br>Return: %{y:.2%}<extra></extra>',
+    ))
+    fig.add_trace(go.Scatter(
+        x=[portfolio['volatility']], y=[portfolio['return']], mode='markers',
+        name=f"Your Portfolio (λ={lambda_param})",
+        marker=dict(color='#54A24B', size=16, symbol='circle', line=dict(width=2, color='white')),
+        hovertemplate=(f"Your Portfolio<br>Volatility: %{{x:.2%}}<br>Return: %{{y:.2%}}"
+                        f"<br>Sharpe: {portfolio['sharpe']:.2f}<extra></extra>"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=[max_sharpe['volatility']], y=[max_sharpe['return']], mode='markers',
+        name='Max Sharpe',
+        marker=dict(color='#E45756', size=20, symbol='star', line=dict(width=2, color='white')),
+        hovertemplate=(f"Max Sharpe<br>Volatility: %{{x:.2%}}<br>Return: %{{y:.2%}}"
+                        f"<br>Sharpe: {max_sharpe['sharpe']:.2f}<extra></extra>"),
+    ))
+    fig.update_layout(
+        title=f"GARCH(1,1) Mean-Variance Frontier ({frequency.capitalize()} Data)",
+        xaxis_title="Volatility (Annualized)",
+        yaxis_title="Expected Return (Annualized)",
+        xaxis_tickformat=".1%",
+        yaxis_tickformat=".1%",
+        hovermode="closest",
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=550,
+        margin=dict(t=60, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.info("Set your tickers and parameters in the sidebar, then click **Run Optimization**. Tickers must be valid Yahoo Finance symbols (e.g. AAPL, VWCE.DE, CSX5.L).")
+    st.info("Search for stocks and set your parameters in the sidebar, then click **Run Optimization**.")
