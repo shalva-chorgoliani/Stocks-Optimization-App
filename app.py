@@ -193,30 +193,41 @@ st.title("📈 GARCH Mean-Variance Portfolio Optimizer")
 st.caption("Fits a GARCH(1,1) model to each asset, then builds an efficient frontier and finds "
            "your optimal portfolio plus the max-Sharpe portfolio.")
 
-DEFAULT_TICKERS = ['CSX5.L', 'EIMI.MI', 'IWQU.MI', 'ZPRV.DE', 'SPYL.DE', 'UETW.DE']
-
 with st.sidebar:
     st.header("Settings")
 
     tickers_text = st.text_area(
         "Tickers (comma-separated)",
-        value=", ".join(DEFAULT_TICKERS),
+        value="",
+        placeholder="e.g. AAPL, MSFT, VWCE.DE",
         help="Use Yahoo Finance ticker symbols, e.g. AAPL, MSFT, VWCE.DE"
     )
     tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
 
     col_a, col_b = st.columns(2)
     with col_a:
-        start_date = st.date_input("Start date", value=pd.to_datetime("2015-01-01"))
+        start_date = st.date_input(
+            "Start date",
+            value=pd.to_datetime("2015-01-01"),
+            min_value=pd.to_datetime("1990-01-01"),
+            max_value=pd.to_datetime("today"),
+        )
     with col_b:
-        end_date = st.date_input("End date", value=pd.to_datetime("today"))
+        end_date = st.date_input(
+            "End date",
+            value=pd.to_datetime("today"),
+            min_value=pd.to_datetime("1990-01-01"),
+            max_value=pd.to_datetime("today"),
+        )
 
     frequency = st.selectbox("Data frequency", ["daily", "monthly", "quarterly", "yearly"], index=1)
 
-    risk_free_rate = st.number_input(
-        "Risk-free rate (annualized, e.g. 0.025 = 2.5%)",
-        value=0.025, step=0.005, format="%.4f"
+    risk_free_rate_pct = st.number_input(
+        "Risk-free rate (%)",
+        value=2.5, step=0.25, format="%.2f",
+        help="Annualized risk-free rate as a percentage, e.g. 2.5 for 2.5%"
     )
+    risk_free_rate = risk_free_rate_pct / 100.0
 
     lambda_param = st.number_input(
         "Risk aversion factor (λ) — higher = more conservative",
