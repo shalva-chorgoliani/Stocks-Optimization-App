@@ -1,8 +1,10 @@
 # GARCH Portfolio Optimizer
 
+Working app is available at https://optimizeme.streamlit.app/
+
 A small local web app (built with [Streamlit](https://streamlit.io)) that wraps the
 GARCH(1,1) mean-variance optimizer. Runs in your browser, but all computation
-happens on your own machine — nothing is uploaded anywhere.
+happens on your own machine — nothing is uploaded anywhere. 
 
 In the app you can set:
 - **Tickers** — any comma-separated list of Yahoo Finance symbols
