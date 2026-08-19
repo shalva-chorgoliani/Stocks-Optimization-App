@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -7,6 +10,45 @@ import requests
 from scipy.optimize import minimize
 
 st.set_page_config(page_title="GARCH Portfolio Optimizer", layout="wide")
+
+# ----------------------------------------------------------------------
+# Local persistence (saved on this computer, in a file next to app.py)
+# ----------------------------------------------------------------------
+DATA_FILE = Path(__file__).parent / "portfolio_data.json"
+
+
+def load_data():
+    if DATA_FILE.exists():
+        try:
+            return json.loads(DATA_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_data(data):
+    try:
+        DATA_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass  # best-effort; don't crash the app if disk write fails
+
+
+def save_last_session(tickers_list):
+    data = load_data()
+    data["last_session"] = tickers_list
+    save_data(data)
+
+
+def save_named_portfolio(name, tickers_list):
+    data = load_data()
+    data.setdefault("saved_portfolios", {})[name] = tickers_list
+    save_data(data)
+
+
+def delete_named_portfolio(name):
+    data = load_data()
+    data.get("saved_portfolios", {}).pop(name, None)
+    save_data(data)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -79,6 +121,10 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
                                       progress_callback=None):
     """
     Mean-variance optimization using GARCH(1,1)-estimated expected returns and covariances.
+
+    Volatility uses the long-run (unconditional) GARCH variance,
+    sigma_LR^2 = omega / (1 - p - q), rather than the one-step-ahead
+    forecast, since the portfolio is not assumed to be rebalanced every period.
     """
     freq_map = {"daily": 252, "monthly": 12, "quarterly": 4, "yearly": 1}
     if frequency not in freq_map:
@@ -137,7 +183,27 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
         resid_last = data[-1] - mu_est * dt
         sigma2_next = omega_est + p_est * sigma2[-1] + q_est * (resid_last ** 2) / dt
 
-        return {"mu": mu_est, "sigma2": sigma2_next, "omega": omega_est, "p": p_est, "q": q_est}
+        # --- Long-run (unconditional) variance: sigma_LR^2 = omega / (1 - p - q) ---
+        persistence = p_est + q_est
+        if persistence < 0.999:
+            sigma2_long_run = omega_est / (1 - persistence)
+            long_run_ok = True
+        else:
+            # Persistence too close to/over 1 (near-integrated process): the long-run
+            # variance is undefined/explosive, so fall back to the sample variance.
+            sigma2_long_run = max(np.var(data) / dt, 1e-8)
+            long_run_ok = False
+
+        return {
+            "mu": mu_est,
+            "sigma2": sigma2_long_run,      # used for optimization (long-run/unconditional variance)
+            "sigma2_next": sigma2_next,     # one-step-ahead forecast, kept for reference/logging only
+            "omega": omega_est,
+            "p": p_est,
+            "q": q_est,
+            "persistence": persistence,
+            "long_run_ok": long_run_ok,
+        }
 
     garch_results = {}
     log_msgs = []
@@ -146,7 +212,13 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
         result = fit_garch_mle(log_returns[col].dropna().values, dt)
         if result is not None:
             garch_results[col] = result
-            log_msgs.append(f"{col}: mu={result['mu']:.4f}, sigma={np.sqrt(result['sigma2']):.4f}")
+            note = "" if result["long_run_ok"] else "  [persistence≈1, used sample variance instead]"
+            log_msgs.append(
+                f"{col}: mu={result['mu']:.4f}, "
+                f"sigma_LR={np.sqrt(result['sigma2']):.4f} "
+                f"(1-step={np.sqrt(result['sigma2_next']):.4f}), "
+                f"p+q={result['persistence']:.3f}{note}"
+            )
         else:
             log_msgs.append(f"{col}: GARCH fit failed, skipping.")
         if progress_callback:
@@ -251,7 +323,8 @@ with st.sidebar:
     st.header("Settings")
 
     if "selected_tickers" not in st.session_state:
-        st.session_state.selected_tickers = []  # list of {"symbol", "name", "exchange"}
+        # Restore whatever was selected last time the app was run on this computer
+        st.session_state.selected_tickers = load_data().get("last_session", [])
 
     st.subheader("Stocks")
     search_query = st.text_input(
@@ -276,6 +349,7 @@ with st.sidebar:
                         st.button("✓", key=f"added_{m['symbol']}", disabled=True)
                     elif st.button("➕", key=f"add_{m['symbol']}"):
                         st.session_state.selected_tickers.append(m)
+                        save_last_session(st.session_state.selected_tickers)
                         st.rerun()
         else:
             st.caption("No matches found. You can still add the raw ticker below.")
@@ -286,6 +360,7 @@ with st.sidebar:
             symbol = manual_ticker.strip().upper()
             if not any(t["symbol"] == symbol for t in st.session_state.selected_tickers):
                 st.session_state.selected_tickers.append({"symbol": symbol, "name": "", "exchange": ""})
+                save_last_session(st.session_state.selected_tickers)
                 st.rerun()
 
     st.markdown("**Selected stocks:**")
@@ -299,12 +374,43 @@ with st.sidebar:
                     st.session_state.selected_tickers = [
                         x for x in st.session_state.selected_tickers if x["symbol"] != t["symbol"]
                     ]
+                    save_last_session(st.session_state.selected_tickers)
                     st.rerun()
         if st.button("Clear all", use_container_width=True):
             st.session_state.selected_tickers = []
+            save_last_session(st.session_state.selected_tickers)
             st.rerun()
     else:
         st.caption("No stocks selected yet — search above and tap ➕ to add.")
+
+    with st.expander("💾 Saved portfolios"):
+        saved = load_data().get("saved_portfolios", {})
+
+        preset_name = st.text_input("Save current list as...", placeholder="e.g. Retirement mix", key="preset_name_box")
+        if st.button("Save current portfolio", key="save_preset_btn"):
+            if preset_name.strip() and st.session_state.selected_tickers:
+                save_named_portfolio(preset_name.strip(), st.session_state.selected_tickers)
+                st.success(f"Saved as '{preset_name.strip()}'")
+            elif not st.session_state.selected_tickers:
+                st.warning("Add some stocks first.")
+            else:
+                st.warning("Give it a name first.")
+
+        if saved:
+            st.divider()
+            chosen = st.selectbox("Load a saved portfolio", options=list(saved.keys()), key="load_preset_select")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Load", key="load_preset_btn", use_container_width=True):
+                    st.session_state.selected_tickers = saved[chosen]
+                    save_last_session(st.session_state.selected_tickers)
+                    st.rerun()
+            with c2:
+                if st.button("Delete", key="delete_preset_btn", use_container_width=True):
+                    delete_named_portfolio(chosen)
+                    st.rerun()
+        else:
+            st.caption("No saved portfolios yet.")
 
     tickers = [t["symbol"] for t in st.session_state.selected_tickers]
 
