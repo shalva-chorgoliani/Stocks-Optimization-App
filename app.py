@@ -119,36 +119,71 @@ def render_holdings(weights_series, name_map, bar_color):
 # Covariance shrinkage helper
 # ----------------------------------------------------------------------
 
-def shrunk_correlation(z_df, min_obs=24, use_shrinkage=True):
+def shrunk_correlation(z_df, min_pair_obs=12, use_shrinkage=True):
     """
-    Correlation of GARCH-standardized residuals using all available data.
+    Correlation of GARCH-standardized residuals that uses ALL available data.
 
-    - Pairwise-complete observations for each pair (handles different histories).
-    - Ledoit-Wolf shrinkage intensity (delta) fit on the largest group of assets
-      that shares at least `min_obs` common dates, applied to the whole matrix.
+    - Each pair (i, j) is estimated on the dates where BOTH assets have data, so a
+      short-history stock never throws away the long history of the others.
+    - Ledoit-Wolf shrinkage toward the identity, computed directly from the
+      pairwise moments (no complete-case matrix needed). Pairs with a short overlap
+      have a noisier estimate, which automatically raises the shrinkage intensity.
+    - The result is forced to be a valid (positive definite) correlation matrix.
     Returns (corr, delta, info_string).
     """
     n = z_df.shape[1]
-    S = z_df.corr(min_periods=min_obs).to_numpy()   # pairwise-complete
-    S = np.nan_to_num(S, nan=0.0)                   # pairs with too little overlap -> 0
+
+    # Demean and scale each asset over its OWN full history
+    Z = z_df - z_df.mean()
+    Z = Z / Z.std(ddof=0)
+    X = Z.to_numpy()
+    M = (~np.isnan(X)).astype(float)
+    Xf = np.nan_to_num(X, nan=0.0)
+
+    cnt = M.T @ M                                   # overlap n_ij for every pair
+    cross = Xf.T @ Xf                               # sum of z_i * z_j over overlap
+    cross_sq = (Xf ** 2).T @ (Xf ** 2)              # sum of z_i^2 * z_j^2 over overlap
+
+    valid = cnt >= min_pair_obs
+    np.fill_diagonal(valid, True)
+    safe_cnt = np.where(cnt > 0, cnt, 1.0)
+
+    S = np.where(valid, cross / safe_cnt, 0.0)      # pairwise correlation estimate
+    S = np.clip(S, -1.0, 1.0)
     np.fill_diagonal(S, 1.0)
 
-    if not use_shrinkage:
-        return S, 0.0, "no shrinkage"
+    n_offdiag = n * (n - 1)
+    n_dropped = int((~valid).sum())
+    overlaps = cnt[~np.eye(n, dtype=bool)]
+    overlap_txt = (f"pair overlap min/median/max = {int(overlaps.min())}/"
+                   f"{int(np.median(overlaps))}/{int(overlaps.max())}, "
+                   f"{n_dropped} of {n_offdiag} pairs below {min_pair_obs} obs set to 0")
 
-    # Longest-history assets first; add assets while a common window is still long enough
-    order = z_df.notna().sum().sort_values(ascending=False).index
-    delta, info = 0.0, "not enough overlapping data to estimate shrinkage"
-    for k in range(n, 1, -1):
-        sub = z_df[order[:k]].dropna()
-        if len(sub) >= max(min_obs, k + 1):
-            lw = LedoitWolf().fit(sub.values)
-            delta = float(lw.shrinkage_)
-            info = f"LW shrinkage={delta:.4f} (fit on {k}/{n} assets, {len(sub)} common obs)"
-            break
+    delta = 0.0
+    if use_shrinkage:
+        # Ledoit-Wolf: delta = min(beta, d) / d, with
+        #   d    = ||S - I||_F^2                       (distance to the target)
+        #   beta = sum_ij Var(estimate of S_ij)        (estimation noise)
+        raw = np.where(valid, cross / safe_cnt, 0.0)
+        var_prod = np.where(valid, cross_sq / safe_cnt - raw ** 2, 0.0)
+        var_est = np.clip(var_prod, 0.0, None) / safe_cnt
+        beta = float(var_est[valid].sum())
+        d = float(((S - np.eye(n)) ** 2).sum())
+        delta = float(min(beta, d) / d) if d > 1e-12 else 0.0
 
     corr = (1 - delta) * S + delta * np.eye(n)
-    return corr, delta, info
+
+    # Pairwise estimates can be indefinite: clip eigenvalues, then rescale to unit diagonal
+    eigvals, eigvecs = np.linalg.eigh((corr + corr.T) / 2)
+    if eigvals.min() < 1e-6:
+        eigvals = np.clip(eigvals, 1e-6, None)
+        corr = (eigvecs * eigvals) @ eigvecs.T
+        dd = np.sqrt(np.diag(corr))
+        corr = corr / np.outer(dd, dd)
+        overlap_txt += "; matrix repaired to be positive definite"
+
+    shrink_txt = f"LW shrinkage={delta:.4f}" if use_shrinkage else "no shrinkage"
+    return corr, delta, f"{shrink_txt}; {overlap_txt}"
 
 
 # ----------------------------------------------------------------------
@@ -156,7 +191,7 @@ def shrunk_correlation(z_df, min_obs=24, use_shrinkage=True):
 # ----------------------------------------------------------------------
 
 def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=0.02, frequency="monthly",
-                                      progress_callback=None, use_shrinkage=True):
+                                      progress_callback=None, use_shrinkage=True, min_pair_obs=12):
     """
     Mean-variance optimization using GARCH(1,1)-estimated expected returns and covariances.
 
@@ -283,7 +318,7 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
 
     # Correlation from standardized residuals: pairwise-complete + Ledoit-Wolf shrinkage
     z_df = pd.concat({a: garch_results[a]["z"] for a in valid_assets}, axis=1)
-    corr_matrix, delta, shrink_info = shrunk_correlation(z_df, use_shrinkage=use_shrinkage)
+    corr_matrix, delta, shrink_info = shrunk_correlation(z_df, min_pair_obs=min_pair_obs, use_shrinkage=use_shrinkage)
     log_msgs.append(f"Correlation estimate: {shrink_info}")
 
     D = np.diag(garch_vols)
@@ -501,6 +536,14 @@ with st.sidebar:
         help="Shrinks the correlation matrix toward the identity to reduce estimation noise."
     )
 
+    min_pair_obs = st.number_input(
+        "Min. overlapping observations per pair",
+        min_value=3, value=12, step=1,
+        help="A correlation between two stocks is estimated on the dates where both have data. "
+             "Pairs with fewer overlapping observations than this are treated as uncorrelated. "
+             "Use a larger value (e.g. 60) for daily data."
+    )
+
     run_button = st.button("Run Optimization", type="primary", use_container_width=True)
 
 if run_button:
@@ -556,7 +599,7 @@ if run_button:
         portfolio, max_sharpe, asset_names, frontier_vols, frontier_rets, log_msgs = mean_variance_optimization_garch(
             returns, lambda_param=lambda_param, risk_free_rate=risk_free_rate,
             frequency=frequency, progress_callback=update_progress,
-            use_shrinkage=use_shrinkage
+            use_shrinkage=use_shrinkage, min_pair_obs=int(min_pair_obs)
         )
     except Exception as e:
         st.error(f"Optimization failed: {e}")
