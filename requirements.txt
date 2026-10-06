@@ -5,4 +5,4 @@ plotly>=5.18
 scipy>=1.10
 yfinance>=0.2.40
 requests>=2.28
-scikit-learn>=1.32
+scikit-learn>=1.3
