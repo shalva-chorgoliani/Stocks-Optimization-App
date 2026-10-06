@@ -8,6 +8,7 @@ import yfinance as yf
 import streamlit as st
 import requests
 from scipy.optimize import minimize
+from sklearn.covariance import LedoitWolf
 
 st.set_page_config(page_title="GARCH Portfolio Optimizer", layout="wide")
 
@@ -113,18 +114,59 @@ def render_holdings(weights_series, name_map, bar_color):
         """)
     st.markdown("".join(rows), unsafe_allow_html=True)
 
+
 # ----------------------------------------------------------------------
-# Core optimization logic (adapted from the original script)
+# Covariance shrinkage helper
+# ----------------------------------------------------------------------
+
+def shrunk_correlation(z_df, min_obs=24, use_shrinkage=True):
+    """
+    Correlation of GARCH-standardized residuals using all available data.
+
+    - Pairwise-complete observations for each pair (handles different histories).
+    - Ledoit-Wolf shrinkage intensity (delta) fit on the largest group of assets
+      that shares at least `min_obs` common dates, applied to the whole matrix.
+    Returns (corr, delta, info_string).
+    """
+    n = z_df.shape[1]
+    S = z_df.corr(min_periods=min_obs).to_numpy()   # pairwise-complete
+    S = np.nan_to_num(S, nan=0.0)                   # pairs with too little overlap -> 0
+    np.fill_diagonal(S, 1.0)
+
+    if not use_shrinkage:
+        return S, 0.0, "no shrinkage"
+
+    # Longest-history assets first; add assets while a common window is still long enough
+    order = z_df.notna().sum().sort_values(ascending=False).index
+    delta, info = 0.0, "not enough overlapping data to estimate shrinkage"
+    for k in range(n, 1, -1):
+        sub = z_df[order[:k]].dropna()
+        if len(sub) >= max(min_obs, k + 1):
+            lw = LedoitWolf().fit(sub.values)
+            delta = float(lw.shrinkage_)
+            info = f"LW shrinkage={delta:.4f} (fit on {k}/{n} assets, {len(sub)} common obs)"
+            break
+
+    corr = (1 - delta) * S + delta * np.eye(n)
+    return corr, delta, info
+
+
+# ----------------------------------------------------------------------
+# Core optimization logic
 # ----------------------------------------------------------------------
 
 def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=0.02, frequency="monthly",
-                                      progress_callback=None):
+                                      progress_callback=None, use_shrinkage=True):
     """
     Mean-variance optimization using GARCH(1,1)-estimated expected returns and covariances.
 
     Volatility uses the long-run (unconditional) GARCH variance,
     sigma_LR^2 = omega / (1 - p - q), rather than the one-step-ahead
     forecast, since the portfolio is not assumed to be rebalanced every period.
+
+    The correlation matrix is estimated from GARCH-standardized residuals using
+    pairwise-complete observations (so stocks with shorter histories still
+    contribute all their data) and Ledoit-Wolf shrinkage.
     """
     freq_map = {"daily": 252, "monthly": 12, "quarterly": 4, "yearly": 1}
     if frequency not in freq_map:
@@ -159,8 +201,9 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
         return ll
 
     def fit_garch_mle(log_ret_series, dt):
-        data = np.asarray(log_ret_series).astype(float)
-        data = data[~np.isnan(data)]
+        # Takes a pandas Series so we keep the dates for the standardized residuals
+        series = log_ret_series.dropna()
+        data = series.to_numpy().astype(float)
         if len(data) < 10:
             return None
         mu0 = np.mean(data) / dt
@@ -183,6 +226,10 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
         resid_last = data[-1] - mu_est * dt
         sigma2_next = omega_est + p_est * sigma2[-1] + q_est * (resid_last ** 2) / dt
 
+        # Standardized residuals z_t = (r_t - mu*dt) / sqrt(sigma2_t * dt), indexed by date
+        z = (data - mu_est * dt) / np.sqrt(sigma2 * dt)
+        z = pd.Series(z, index=series.index)
+
         # --- Long-run (unconditional) variance: sigma_LR^2 = omega / (1 - p - q) ---
         persistence = p_est + q_est
         if persistence < 0.999:
@@ -203,24 +250,26 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
             "q": q_est,
             "persistence": persistence,
             "long_run_ok": long_run_ok,
+            "z": z,
+            "n_obs": len(data),
         }
 
     garch_results = {}
     log_msgs = []
     cols = list(log_returns.columns)
     for i, col in enumerate(cols):
-        result = fit_garch_mle(log_returns[col].dropna().values, dt)
+        result = fit_garch_mle(log_returns[col], dt)
         if result is not None:
             garch_results[col] = result
             note = "" if result["long_run_ok"] else "  [persistence≈1, used sample variance instead]"
             log_msgs.append(
-                f"{col}: mu={result['mu']:.4f}, "
+                f"{col}: n={result['n_obs']}, mu={result['mu']:.4f}, "
                 f"sigma_LR={np.sqrt(result['sigma2']):.4f} "
                 f"(1-step={np.sqrt(result['sigma2_next']):.4f}), "
                 f"p+q={result['persistence']:.3f}{note}"
             )
         else:
-            log_msgs.append(f"{col}: GARCH fit failed, skipping.")
+            log_msgs.append(f"{col}: GARCH fit failed (too little data), skipping.")
         if progress_callback:
             progress_callback((i + 1) / len(cols))
 
@@ -228,15 +277,14 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
         raise ValueError("Not enough assets with successful GARCH fits (need at least 2).")
 
     valid_assets = list(garch_results.keys())
-    log_returns_valid = log_returns[valid_assets]
 
     mu = np.array([garch_results[a]["mu"] for a in valid_assets])
     garch_vols = np.array([np.sqrt(garch_results[a]["sigma2"]) for a in valid_assets])
 
-    log_ret_array = log_returns_valid.dropna(how='all').to_numpy()
-    corr_matrix = np.corrcoef(log_ret_array.T)
-    corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
-    np.fill_diagonal(corr_matrix, 1.0)
+    # Correlation from standardized residuals: pairwise-complete + Ledoit-Wolf shrinkage
+    z_df = pd.concat({a: garch_results[a]["z"] for a in valid_assets}, axis=1)
+    corr_matrix, delta, shrink_info = shrunk_correlation(z_df, use_shrinkage=use_shrinkage)
+    log_msgs.append(f"Correlation estimate: {shrink_info}")
 
     D = np.diag(garch_vols)
     cov = D @ corr_matrix @ D
@@ -259,6 +307,7 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
     eigs = np.linalg.eigvalsh(cov)
     if np.any(eigs <= 0):
         cov = nearest_positive_definite(cov)
+        log_msgs.append("Covariance matrix was not positive definite; repaired.")
 
     n_assets = len(valid_assets)
 
@@ -446,6 +495,12 @@ with st.sidebar:
         value=3.0, step=0.5, format="%.2f"
     )
 
+    use_shrinkage = st.checkbox(
+        "Ledoit-Wolf covariance shrinkage",
+        value=True,
+        help="Shrinks the correlation matrix toward the identity to reduce estimation noise."
+    )
+
     run_button = st.button("Run Optimization", type="primary", use_container_width=True)
 
 if run_button:
@@ -489,7 +544,8 @@ if run_button:
     if missing:
         st.warning(f"No data found for: {', '.join(missing)} (skipped)")
 
-    returns = prices.pct_change()
+    # fill_method=None: a missing price stays NaN instead of being forward-filled into a fake 0% return
+    returns = prices.pct_change(fill_method=None)
 
     progress_bar = st.progress(0.0, text="Fitting GARCH(1,1) models...")
 
@@ -499,7 +555,8 @@ if run_button:
     try:
         portfolio, max_sharpe, asset_names, frontier_vols, frontier_rets, log_msgs = mean_variance_optimization_garch(
             returns, lambda_param=lambda_param, risk_free_rate=risk_free_rate,
-            frequency=frequency, progress_callback=update_progress
+            frequency=frequency, progress_callback=update_progress,
+            use_shrinkage=use_shrinkage
         )
     except Exception as e:
         st.error(f"Optimization failed: {e}")
