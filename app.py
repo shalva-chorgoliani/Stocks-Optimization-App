@@ -384,6 +384,13 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
     r2, v2, s2 = portfolio_stats(res2.x)
     max_sharpe = {'return': r2, 'volatility': v2, 'sharpe': s2, 'weights': res2.x}
 
+    # Minimum-variance portfolio (long-only, fully invested)
+    res3 = minimize(lambda w: np.dot(w, np.dot(cov, w)), w0, method='SLSQP', bounds=bnds, constraints=cons)
+    if not res3.success:
+        raise ValueError(f"Minimum-variance optimization failed: {res3.message}")
+    r3, v3, s3 = portfolio_stats(res3.x)
+    min_var = {'return': r3, 'volatility': v3, 'sharpe': s3, 'weights': res3.x}
+
     lambda_range = np.logspace(-2, 2, 30)
     vols, rets = [], []
     w_prev = w0.copy()
@@ -406,7 +413,7 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
     rets, vols = rets[mask], vols[mask]
 
     asset_names = pd.Index(valid_assets)
-    return portfolio, max_sharpe, asset_names, vols, rets, log_msgs
+    return portfolio, max_sharpe, min_var, asset_names, vols, rets, log_msgs
 
 
 # ----------------------------------------------------------------------
@@ -612,7 +619,7 @@ if run_button:
         progress_bar.progress(frac, text=f"Fitting GARCH(1,1) models... {int(frac * 100)}%")
 
     try:
-        portfolio, max_sharpe, asset_names, frontier_vols, frontier_rets, log_msgs = mean_variance_optimization_garch(
+        portfolio, max_sharpe, min_var, asset_names, frontier_vols, frontier_rets, log_msgs = mean_variance_optimization_garch(
             returns, lambda_param=lambda_param, risk_free_rate=risk_free_rate,
             frequency=frequency, progress_callback=update_progress,
             min_pair_obs=int(min_pair_obs), use_shrinkage=use_shrinkage
@@ -654,6 +661,20 @@ if run_button:
         render_holdings(weights_sharpe, name_map, bar_color="#E45756")
 
     st.divider()
+    st.subheader("Minimum-Variance Portfolio")
+    st.caption("The long-only portfolio with the lowest possible volatility, regardless of expected return.")
+    mv_left, mv_right = st.columns(2)
+    with mv_left:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Expected Return", f"{min_var['return']:.2%}")
+        m2.metric("Volatility", f"{min_var['volatility']:.2%}")
+        m3.metric("Sharpe Ratio", f"{min_var['sharpe']:.3f}")
+    with mv_right:
+        weights_mv = pd.Series(min_var['weights'], index=asset_names, name="Weight")
+        weights_mv = weights_mv[weights_mv > 0.0001].sort_values(ascending=False)
+        render_holdings(weights_mv, name_map, bar_color="#F58518")
+
+    st.divider()
     st.subheader("Efficient Frontier")
 
     fig = go.Figure()
@@ -676,6 +697,13 @@ if run_button:
         marker=dict(color='#E45756', size=20, symbol='star', line=dict(width=2, color='white')),
         hovertemplate=(f"Max Sharpe<br>Volatility: %{{x:.2%}}<br>Return: %{{y:.2%}}"
                         f"<br>Sharpe: {max_sharpe['sharpe']:.2f}<extra></extra>"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=[min_var['volatility']], y=[min_var['return']], mode='markers',
+        name='Min Variance',
+        marker=dict(color='#F58518', size=16, symbol='diamond', line=dict(width=2, color='white')),
+        hovertemplate=(f"Min Variance<br>Volatility: %{{x:.2%}}<br>Return: %{{y:.2%}}"
+                        f"<br>Sharpe: {min_var['sharpe']:.2f}<extra></extra>"),
     ))
     fig.update_layout(
         title=f"GARCH(1,1) Mean-Variance Frontier ({frequency.capitalize()} Data)",
