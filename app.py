@@ -8,7 +8,6 @@ import yfinance as yf
 import streamlit as st
 import requests
 from scipy.optimize import minimize
-from sklearn.covariance import LedoitWolf
 
 st.set_page_config(page_title="GARCH Portfolio Optimizer", layout="wide")
 
@@ -121,7 +120,7 @@ def render_holdings(weights_series, name_map, bar_color):
 
 def pairwise_moments(z_df, min_pair_obs=12):
     """
-    Pairwise-complete correlation of each asset's (demeaned, unit-variance) series.
+    Pairwise-complete correlation of each asset's (demeaned, unit-variance) return series.
 
     Returns
       S        : correlation matrix (unit diagonal; pairs with too little overlap = 0)
@@ -171,39 +170,17 @@ def _make_psd(A, min_eig, note):
     return A, ""
 
 
-def shrunk_correlation(z_df, min_pair_obs=12, use_shrinkage=True):
+def shrunk_covariance(returns_df, vols, min_pair_obs=12, use_shrinkage=True):
     """
-    Correlation-only shrinkage (variances untouched).
-    R = (1 - delta) * S + delta * I, delta from Ledoit-Wolf on the pairwise moments.
-    Returns (corr, delta, info_string).
-    """
-    n = z_df.shape[1]
-    S, valid, var_est, overlap_txt = pairwise_moments(z_df, min_pair_obs)
+    Variance-covariance matrix with optional Ledoit-Wolf shrinkage.
 
-    delta = 0.0
-    if use_shrinkage:
-        beta = float(var_est[valid].sum())
-        d = float(((S - np.eye(n)) ** 2).sum())
-        delta = float(min(beta, d) / d) if d > 1e-12 else 0.0
+    Steps:
+      1. pairwise correlations from all dates where both assets have data
+      2. combine with the GARCH long-run volatilities:  S_ij = vol_i * vol_j * corr_ij
+      3. shrink the whole matrix (variances and covariances together), if use_shrinkage
 
-    corr = (1 - delta) * S + delta * np.eye(n)
-    corr, note = _make_psd(corr, 1e-6, "matrix repaired to be positive definite")
-    if note:
-        dd = np.sqrt(np.diag(corr))
-        corr = corr / np.outer(dd, dd)
-        overlap_txt += "; " + note
-
-    shrink_txt = f"LW shrinkage={delta:.4f}" if use_shrinkage else "no shrinkage"
-    return corr, delta, f"{shrink_txt}; {overlap_txt}"
-
-
-def shrunk_covariance(z_df, vols, min_pair_obs=12):
-    """
-    Full-covariance Ledoit-Wolf shrinkage, using GARCH volatilities on the diagonal.
-
-      S_ij   = vol_i * vol_j * corr_ij          (pairwise correlations, GARCH variances)
       target = mu * I,  mu = average variance   (trace(S) / n)
-      Sigma  = (1 - delta) * S + delta * target
+      Sigma  = (1 - delta) * S + delta * target     (delta = 0 when shrinkage is off)
 
     delta = min(beta, d) / d, where
       d    = ||S - target||_F^2
@@ -211,8 +188,8 @@ def shrunk_covariance(z_df, vols, min_pair_obs=12):
     With complete data and sample volatilities this is exactly sklearn's LedoitWolf.
     Returns (cov, delta, info_string).
     """
-    n = z_df.shape[1]
-    S_corr, valid, var_est, overlap_txt = pairwise_moments(z_df, min_pair_obs)
+    n = returns_df.shape[1]
+    S_corr, valid, var_est, overlap_txt = pairwise_moments(returns_df, min_pair_obs)
 
     cov_S = np.outer(vols, vols) * S_corr
     mu_bar = float(np.trace(cov_S) / n)
@@ -221,14 +198,15 @@ def shrunk_covariance(z_df, vols, min_pair_obs=12):
     w = vols ** 2
     beta = float((np.outer(w, w) * var_est)[valid].sum())
     d = float(((cov_S - target) ** 2).sum())
-    delta = float(min(beta, d) / d) if d > 1e-18 else 0.0
+    delta = float(min(beta, d) / d) if (use_shrinkage and d > 1e-18) else 0.0
 
     cov = (1 - delta) * cov_S + delta * target
     cov, note = _make_psd(cov, 1e-8 * mu_bar, "matrix repaired to be positive definite")
     if note:
         overlap_txt += "; " + note
 
-    info = f"LW shrinkage (full covariance)={delta:.4f}; {overlap_txt}"
+    shrink_txt = f"LW shrinkage={delta:.4f}" if use_shrinkage else "no shrinkage"
+    info = f"{shrink_txt}; {overlap_txt}"
     return cov, delta, info
 
 
@@ -237,17 +215,16 @@ def shrunk_covariance(z_df, vols, min_pair_obs=12):
 # ----------------------------------------------------------------------
 
 def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=0.02, frequency="monthly",
-                                      progress_callback=None, shrink_mode="cov", min_pair_obs=12, corr_method="raw_pairwise"):
+                                      progress_callback=None, min_pair_obs=12, use_shrinkage=True):
     """
-    Mean-variance optimization using GARCH(1,1)-estimated expected returns and covariances.
+    Mean-variance optimization.
 
-    Volatility uses the long-run (unconditional) GARCH variance,
-    sigma_LR^2 = omega / (1 - p - q), rather than the one-step-ahead
-    forecast, since the portfolio is not assumed to be rebalanced every period.
-
-    The correlation matrix is estimated from GARCH-standardized residuals using
-    pairwise-complete observations (so stocks with shorter histories still
-    contribute all their data) and Ledoit-Wolf shrinkage.
+    1. Expected return (mu) and long-run volatility of each asset from a Brownian-motion
+       model with GARCH(1,1) errors, fitted on that asset's full available history.
+    2. Correlations estimated pairwise, using every date where both assets have data.
+    3. Variance-covariance matrix = long-run GARCH volatilities + pairwise correlations.
+    4. Ledoit-Wolf shrinkage of the whole matrix (optional, use_shrinkage).
+    5. Portfolio optimization.
     """
     freq_map = {"daily": 252, "monthly": 12, "quarterly": 4, "yearly": 1}
     if frequency not in freq_map:
@@ -282,7 +259,6 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
         return ll
 
     def fit_garch_mle(log_ret_series, dt):
-        # Takes a pandas Series so we keep the dates for the standardized residuals
         series = log_ret_series.dropna()
         data = series.to_numpy().astype(float)
         if len(data) < 10:
@@ -307,10 +283,6 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
         resid_last = data[-1] - mu_est * dt
         sigma2_next = omega_est + p_est * sigma2[-1] + q_est * (resid_last ** 2) / dt
 
-        # Standardized residuals z_t = (r_t - mu*dt) / sqrt(sigma2_t * dt), indexed by date
-        z = (data - mu_est * dt) / np.sqrt(sigma2 * dt)
-        z = pd.Series(z, index=series.index)
-
         # --- Long-run (unconditional) variance: sigma_LR^2 = omega / (1 - p - q) ---
         persistence = p_est + q_est
         if persistence < 0.999:
@@ -331,7 +303,6 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
             "q": q_est,
             "persistence": persistence,
             "long_run_ok": long_run_ok,
-            "z": z,
             "n_obs": len(data),
         }
 
@@ -362,34 +333,10 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
     mu = np.array([garch_results[a]["mu"] for a in valid_assets])
     garch_vols = np.array([np.sqrt(garch_results[a]["sigma2"]) for a in valid_assets])
 
-    # ---- Covariance matrix ----
-    D = np.diag(garch_vols)
-    if corr_method == "legacy":
-        # Exact behaviour of the original app: np.corrcoef on raw log returns.
-        # NOTE: any asset with a missing value gets NaN correlations, which become 0.
-        log_ret_array = log_returns[valid_assets].dropna(how='all').to_numpy()
-        corr_matrix = np.corrcoef(log_ret_array.T)
-        corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
-        np.fill_diagonal(corr_matrix, 1.0)
-        n_zeroed = int(((corr_matrix == 0).sum()))
-        cov = D @ corr_matrix @ D
-        log_msgs.append(f"Covariance: legacy (raw returns, NaN->0); {n_zeroed} correlation entries are "
-                        f"exactly 0; shrinkage not applied")
-    else:
-        if corr_method == "garch_pairwise":
-            z_df = pd.concat({a: garch_results[a]["z"] for a in valid_assets}, axis=1)
-            label = "GARCH residuals"
-        else:
-            z_df = log_returns[valid_assets]
-            label = "raw log returns"
-
-        if shrink_mode == "cov":
-            cov, delta, info = shrunk_covariance(z_df, garch_vols, min_pair_obs=min_pair_obs)
-        else:
-            corr_matrix, delta, info = shrunk_correlation(
-                z_df, min_pair_obs=min_pair_obs, use_shrinkage=(shrink_mode == "corr"))
-            cov = D @ corr_matrix @ D
-        log_msgs.append(f"Covariance (correlations from {label}, pairwise): {info}")
+    # ---- Steps 2-4: pairwise correlations + GARCH vols -> covariance matrix -> shrinkage ----
+    cov, delta, cov_info = shrunk_covariance(log_returns[valid_assets], garch_vols,
+                                           min_pair_obs=min_pair_obs, use_shrinkage=use_shrinkage)
+    log_msgs.append(f"Covariance: {cov_info}")
 
     def nearest_positive_definite(A):
         B = (A + A.T) / 2
@@ -597,30 +544,12 @@ with st.sidebar:
         value=3.0, step=0.5, format="%.2f"
     )
 
-    corr_label = st.selectbox(
-        "Correlation estimator",
-        ["Raw returns, pairwise (all data)",
-         "GARCH residuals, pairwise (all data)",
-         "Original app (raw returns, missing -> 0)"],
-        help="'Original app' reproduces the first version exactly, including its quirk that any stock "
-             "with missing data is treated as uncorrelated with every other stock."
+    use_shrinkage = st.checkbox(
+        "Ledoit-Wolf covariance shrinkage",
+        value=True,
+        help="Shrinks the whole covariance matrix (GARCH variances and pairwise covariances together) "
+             "toward a scaled identity: average variance on the diagonal, zero covariances elsewhere."
     )
-    corr_method = {"Raw returns, pairwise (all data)": "raw_pairwise",
-                   "GARCH residuals, pairwise (all data)": "garch_pairwise",
-                   "Original app (raw returns, missing -> 0)": "legacy"}[corr_label]
-
-    shrink_label = st.selectbox(
-        "Ledoit-Wolf shrinkage",
-        ["Full covariance (variances + covariances)",
-         "Correlations only",
-         "None"],
-        help="Full covariance: GARCH variances and pairwise covariances are shrunk together toward "
-             "a scaled identity (average variance on the diagonal, 0 elsewhere). "
-             "Correlations only: variances are left as the GARCH gives them."
-    )
-    shrink_mode = {"Full covariance (variances + covariances)": "cov",
-                   "Correlations only": "corr",
-                   "None": "none"}[shrink_label]
 
     min_pair_obs = st.number_input(
         "Min. overlapping observations per pair",
@@ -674,10 +603,8 @@ if run_button:
         st.warning(f"No data found for: {', '.join(missing)} (skipped)")
 
     # Non-legacy: a missing price stays NaN instead of being forward-filled into a fake 0% return
-    if corr_method == "legacy":
-        returns = prices.ffill().pct_change(fill_method=None)   # same as the original pct_change() default
-    else:
-        returns = prices.pct_change(fill_method=None)
+    # A missing price stays NaN (no forward-fill into a fake 0% return)
+    returns = prices.pct_change(fill_method=None)
 
     progress_bar = st.progress(0.0, text="Fitting GARCH(1,1) models...")
 
@@ -688,7 +615,7 @@ if run_button:
         portfolio, max_sharpe, asset_names, frontier_vols, frontier_rets, log_msgs = mean_variance_optimization_garch(
             returns, lambda_param=lambda_param, risk_free_rate=risk_free_rate,
             frequency=frequency, progress_callback=update_progress,
-            shrink_mode=shrink_mode, min_pair_obs=int(min_pair_obs), corr_method=corr_method
+            min_pair_obs=int(min_pair_obs), use_shrinkage=use_shrinkage
         )
     except Exception as e:
         st.error(f"Optimization failed: {e}")
