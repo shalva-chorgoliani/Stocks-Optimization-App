@@ -119,21 +119,17 @@ def render_holdings(weights_series, name_map, bar_color):
 # Covariance shrinkage helper
 # ----------------------------------------------------------------------
 
-def shrunk_correlation(z_df, min_pair_obs=12, use_shrinkage=True):
+def pairwise_moments(z_df, min_pair_obs=12):
     """
-    Correlation of GARCH-standardized residuals that uses ALL available data.
+    Pairwise-complete correlation of each asset's (demeaned, unit-variance) series.
 
-    - Each pair (i, j) is estimated on the dates where BOTH assets have data, so a
-      short-history stock never throws away the long history of the others.
-    - Ledoit-Wolf shrinkage toward the identity, computed directly from the
-      pairwise moments (no complete-case matrix needed). Pairs with a short overlap
-      have a noisier estimate, which automatically raises the shrinkage intensity.
-    - The result is forced to be a valid (positive definite) correlation matrix.
-    Returns (corr, delta, info_string).
+    Returns
+      S        : correlation matrix (unit diagonal; pairs with too little overlap = 0)
+      valid    : boolean matrix, True where the pair has >= min_pair_obs overlapping obs
+      var_est  : estimated sampling variance of each S_ij  (Var(z_i z_j) / n_ij)
+      overlap_txt : short description of the overlaps
     """
     n = z_df.shape[1]
-
-    # Demean and scale each asset over its OWN full history
     Z = z_df - z_df.mean()
     Z = Z / Z.std(ddof=0)
     X = Z.to_numpy()
@@ -141,49 +137,99 @@ def shrunk_correlation(z_df, min_pair_obs=12, use_shrinkage=True):
     Xf = np.nan_to_num(X, nan=0.0)
 
     cnt = M.T @ M                                   # overlap n_ij for every pair
-    cross = Xf.T @ Xf                               # sum of z_i * z_j over overlap
-    cross_sq = (Xf ** 2).T @ (Xf ** 2)              # sum of z_i^2 * z_j^2 over overlap
+    cross = Xf.T @ Xf                               # sum z_i z_j over the overlap
+    cross_sq = (Xf ** 2).T @ (Xf ** 2)              # sum z_i^2 z_j^2 over the overlap
 
     valid = cnt >= min_pair_obs
     np.fill_diagonal(valid, True)
     safe_cnt = np.where(cnt > 0, cnt, 1.0)
 
-    S = np.where(valid, cross / safe_cnt, 0.0)      # pairwise correlation estimate
-    S = np.clip(S, -1.0, 1.0)
+    raw = np.where(valid, cross / safe_cnt, 0.0)
+    S = np.clip(raw, -1.0, 1.0)
     np.fill_diagonal(S, 1.0)
 
-    n_offdiag = n * (n - 1)
-    n_dropped = int((~valid).sum())
-    overlaps = cnt[~np.eye(n, dtype=bool)]
+    var_prod = np.where(valid, cross_sq / safe_cnt - raw ** 2, 0.0)
+    var_est = np.clip(var_prod, 0.0, None) / safe_cnt
+
+    off = ~np.eye(n, dtype=bool)
+    overlaps = cnt[off]
     overlap_txt = (f"pair overlap min/median/max = {int(overlaps.min())}/"
                    f"{int(np.median(overlaps))}/{int(overlaps.max())}, "
-                   f"{n_dropped} of {n_offdiag} pairs below {min_pair_obs} obs set to 0")
+                   f"{int((~valid).sum())} of {n * (n - 1)} pairs below {min_pair_obs} obs set to 0")
+    return S, valid, var_est, overlap_txt
+
+
+def _make_psd(A, min_eig, note):
+    """Clip eigenvalues of a symmetric matrix at `min_eig` if needed."""
+    A = (A + A.T) / 2
+    w, V = np.linalg.eigh(A)
+    if w.min() < min_eig:
+        w = np.clip(w, min_eig, None)
+        A = (V * w) @ V.T
+        A = (A + A.T) / 2
+        return A, note
+    return A, ""
+
+
+def shrunk_correlation(z_df, min_pair_obs=12, use_shrinkage=True):
+    """
+    Correlation-only shrinkage (variances untouched).
+    R = (1 - delta) * S + delta * I, delta from Ledoit-Wolf on the pairwise moments.
+    Returns (corr, delta, info_string).
+    """
+    n = z_df.shape[1]
+    S, valid, var_est, overlap_txt = pairwise_moments(z_df, min_pair_obs)
 
     delta = 0.0
     if use_shrinkage:
-        # Ledoit-Wolf: delta = min(beta, d) / d, with
-        #   d    = ||S - I||_F^2                       (distance to the target)
-        #   beta = sum_ij Var(estimate of S_ij)        (estimation noise)
-        raw = np.where(valid, cross / safe_cnt, 0.0)
-        var_prod = np.where(valid, cross_sq / safe_cnt - raw ** 2, 0.0)
-        var_est = np.clip(var_prod, 0.0, None) / safe_cnt
         beta = float(var_est[valid].sum())
         d = float(((S - np.eye(n)) ** 2).sum())
         delta = float(min(beta, d) / d) if d > 1e-12 else 0.0
 
     corr = (1 - delta) * S + delta * np.eye(n)
-
-    # Pairwise estimates can be indefinite: clip eigenvalues, then rescale to unit diagonal
-    eigvals, eigvecs = np.linalg.eigh((corr + corr.T) / 2)
-    if eigvals.min() < 1e-6:
-        eigvals = np.clip(eigvals, 1e-6, None)
-        corr = (eigvecs * eigvals) @ eigvecs.T
+    corr, note = _make_psd(corr, 1e-6, "matrix repaired to be positive definite")
+    if note:
         dd = np.sqrt(np.diag(corr))
         corr = corr / np.outer(dd, dd)
-        overlap_txt += "; matrix repaired to be positive definite"
+        overlap_txt += "; " + note
 
     shrink_txt = f"LW shrinkage={delta:.4f}" if use_shrinkage else "no shrinkage"
     return corr, delta, f"{shrink_txt}; {overlap_txt}"
+
+
+def shrunk_covariance(z_df, vols, min_pair_obs=12):
+    """
+    Full-covariance Ledoit-Wolf shrinkage, using GARCH volatilities on the diagonal.
+
+      S_ij   = vol_i * vol_j * corr_ij          (pairwise correlations, GARCH variances)
+      target = mu * I,  mu = average variance   (trace(S) / n)
+      Sigma  = (1 - delta) * S + delta * target
+
+    delta = min(beta, d) / d, where
+      d    = ||S - target||_F^2
+      beta = sum_ij vol_i^2 vol_j^2 * Var(corr_ij estimate)
+    With complete data and sample volatilities this is exactly sklearn's LedoitWolf.
+    Returns (cov, delta, info_string).
+    """
+    n = z_df.shape[1]
+    S_corr, valid, var_est, overlap_txt = pairwise_moments(z_df, min_pair_obs)
+
+    cov_S = np.outer(vols, vols) * S_corr
+    mu_bar = float(np.trace(cov_S) / n)
+    target = mu_bar * np.eye(n)
+
+    w = vols ** 2
+    beta = float((np.outer(w, w) * var_est)[valid].sum())
+    d = float(((cov_S - target) ** 2).sum())
+    delta = float(min(beta, d) / d) if d > 1e-18 else 0.0
+
+    cov = (1 - delta) * cov_S + delta * target
+    cov, note = _make_psd(cov, 1e-8 * mu_bar, "matrix repaired to be positive definite")
+    if note:
+        overlap_txt += "; " + note
+
+    info = f"LW shrinkage (full covariance)={delta:.4f}; {overlap_txt}"
+    return cov, delta, info
 
 
 # ----------------------------------------------------------------------
@@ -191,7 +237,7 @@ def shrunk_correlation(z_df, min_pair_obs=12, use_shrinkage=True):
 # ----------------------------------------------------------------------
 
 def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=0.02, frequency="monthly",
-                                      progress_callback=None, use_shrinkage=True, min_pair_obs=12):
+                                      progress_callback=None, shrink_mode="cov", min_pair_obs=12, corr_method="raw_pairwise"):
     """
     Mean-variance optimization using GARCH(1,1)-estimated expected returns and covariances.
 
@@ -316,13 +362,34 @@ def mean_variance_optimization_garch(returns_data, lambda_param, risk_free_rate=
     mu = np.array([garch_results[a]["mu"] for a in valid_assets])
     garch_vols = np.array([np.sqrt(garch_results[a]["sigma2"]) for a in valid_assets])
 
-    # Correlation from standardized residuals: pairwise-complete + Ledoit-Wolf shrinkage
-    z_df = pd.concat({a: garch_results[a]["z"] for a in valid_assets}, axis=1)
-    corr_matrix, delta, shrink_info = shrunk_correlation(z_df, min_pair_obs=min_pair_obs, use_shrinkage=use_shrinkage)
-    log_msgs.append(f"Correlation estimate: {shrink_info}")
-
+    # ---- Covariance matrix ----
     D = np.diag(garch_vols)
-    cov = D @ corr_matrix @ D
+    if corr_method == "legacy":
+        # Exact behaviour of the original app: np.corrcoef on raw log returns.
+        # NOTE: any asset with a missing value gets NaN correlations, which become 0.
+        log_ret_array = log_returns[valid_assets].dropna(how='all').to_numpy()
+        corr_matrix = np.corrcoef(log_ret_array.T)
+        corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+        np.fill_diagonal(corr_matrix, 1.0)
+        n_zeroed = int(((corr_matrix == 0).sum()))
+        cov = D @ corr_matrix @ D
+        log_msgs.append(f"Covariance: legacy (raw returns, NaN->0); {n_zeroed} correlation entries are "
+                        f"exactly 0; shrinkage not applied")
+    else:
+        if corr_method == "garch_pairwise":
+            z_df = pd.concat({a: garch_results[a]["z"] for a in valid_assets}, axis=1)
+            label = "GARCH residuals"
+        else:
+            z_df = log_returns[valid_assets]
+            label = "raw log returns"
+
+        if shrink_mode == "cov":
+            cov, delta, info = shrunk_covariance(z_df, garch_vols, min_pair_obs=min_pair_obs)
+        else:
+            corr_matrix, delta, info = shrunk_correlation(
+                z_df, min_pair_obs=min_pair_obs, use_shrinkage=(shrink_mode == "corr"))
+            cov = D @ corr_matrix @ D
+        log_msgs.append(f"Covariance (correlations from {label}, pairwise): {info}")
 
     def nearest_positive_definite(A):
         B = (A + A.T) / 2
@@ -530,11 +597,30 @@ with st.sidebar:
         value=3.0, step=0.5, format="%.2f"
     )
 
-    use_shrinkage = st.checkbox(
-        "Ledoit-Wolf covariance shrinkage",
-        value=True,
-        help="Shrinks the correlation matrix toward the identity to reduce estimation noise."
+    corr_label = st.selectbox(
+        "Correlation estimator",
+        ["Raw returns, pairwise (all data)",
+         "GARCH residuals, pairwise (all data)",
+         "Original app (raw returns, missing -> 0)"],
+        help="'Original app' reproduces the first version exactly, including its quirk that any stock "
+             "with missing data is treated as uncorrelated with every other stock."
     )
+    corr_method = {"Raw returns, pairwise (all data)": "raw_pairwise",
+                   "GARCH residuals, pairwise (all data)": "garch_pairwise",
+                   "Original app (raw returns, missing -> 0)": "legacy"}[corr_label]
+
+    shrink_label = st.selectbox(
+        "Ledoit-Wolf shrinkage",
+        ["Full covariance (variances + covariances)",
+         "Correlations only",
+         "None"],
+        help="Full covariance: GARCH variances and pairwise covariances are shrunk together toward "
+             "a scaled identity (average variance on the diagonal, 0 elsewhere). "
+             "Correlations only: variances are left as the GARCH gives them."
+    )
+    shrink_mode = {"Full covariance (variances + covariances)": "cov",
+                   "Correlations only": "corr",
+                   "None": "none"}[shrink_label]
 
     min_pair_obs = st.number_input(
         "Min. overlapping observations per pair",
@@ -587,8 +673,11 @@ if run_button:
     if missing:
         st.warning(f"No data found for: {', '.join(missing)} (skipped)")
 
-    # fill_method=None: a missing price stays NaN instead of being forward-filled into a fake 0% return
-    returns = prices.pct_change(fill_method=None)
+    # Non-legacy: a missing price stays NaN instead of being forward-filled into a fake 0% return
+    if corr_method == "legacy":
+        returns = prices.ffill().pct_change(fill_method=None)   # same as the original pct_change() default
+    else:
+        returns = prices.pct_change(fill_method=None)
 
     progress_bar = st.progress(0.0, text="Fitting GARCH(1,1) models...")
 
@@ -599,7 +688,7 @@ if run_button:
         portfolio, max_sharpe, asset_names, frontier_vols, frontier_rets, log_msgs = mean_variance_optimization_garch(
             returns, lambda_param=lambda_param, risk_free_rate=risk_free_rate,
             frequency=frequency, progress_callback=update_progress,
-            use_shrinkage=use_shrinkage, min_pair_obs=int(min_pair_obs)
+            shrink_mode=shrink_mode, min_pair_obs=int(min_pair_obs), corr_method=corr_method
         )
     except Exception as e:
         st.error(f"Optimization failed: {e}")
